@@ -1,98 +1,57 @@
-/**
- * ViableUSB / VialUSB - USB HID communication layer for Vial-compatible keyboards
- *
- * Protocol: Standard QMK-VIA / Vial raw HID
- *   Request:  [cmd][args...]          (32 bytes, zero-padded)
- *   Response: [cmd_echo][data...]     (cmd echoed in byte 0)
- *
- * NOTE: The 0xFE "prefix" is NOT sent as a separate byte. In QMK's
- * raw_hid_receive(), the first byte of the report IS the command ID.
- * Some Vial GUI tools prepend 0xFE as a host-side framing convention, but
- * QMK-VIA firmware expects: report[0] = command_id.
- */
-
+// USB HID communication layer for Viable protocol
+// Supports client ID wrapper (0xDD) for multi-client concurrent access
 import type { USBSendOptions } from "../types/vial.types";
-import { MSG_LEN } from "./utils";
+import { BE16, LE16, MSG_LEN } from "./utils";
 
-// ---- VIA command IDs (QMK-VIA standard) ----
-const CMD_VIA_GET_PROTOCOL_VERSION = 0x01;
-const CMD_VIA_GET_KEYBOARD_VALUE = 0x02;
-const CMD_VIA_SET_KEYBOARD_VALUE = 0x03;
-const CMD_VIA_GET_KEYCODE = 0x04;
-const CMD_VIA_SET_KEYCODE = 0x05;
-const CMD_VIA_LIGHTING_SET_VALUE = 0x07;
-const CMD_VIA_LIGHTING_GET_VALUE = 0x08;
-const CMD_VIA_LIGHTING_SAVE = 0x09;
-const CMD_VIA_MACRO_GET_COUNT = 0x0c;
-const CMD_VIA_MACRO_GET_BUFFER_SIZE = 0x0d;
-const CMD_VIA_MACRO_GET_BUFFER = 0x0e;
-const CMD_VIA_MACRO_SET_BUFFER = 0x0f;
-const CMD_VIA_GET_LAYER_COUNT = 0x11;
-const CMD_VIA_KEYMAP_GET_BUFFER = 0x12;
+// Protocol prefixes
+const WRAPPER_PREFIX = 0xdd;
+const VIABLE_PREFIX = 0xdf;
+const VIA_PREFIX = 0xfe;
 
-// VIA "keyboard value" IDs
-const VIA_VALUE_LAYOUT_OPTIONS = 0x02;
-const VIA_VALUE_SWITCH_MATRIX_STATE = 0x03;
+// Client ID constants
+const NONCE_SIZE = 20;
+const DEFAULT_TTL_SECS = 120;
 
-// QMK lighting value IDs (channel 1 = backlight, 2 = rgblight)
-const QMK_BACKLIGHT_BRIGHTNESS = 0x09;
-const QMK_BACKLIGHT_EFFECT = 0x0a;
-const QMK_RGBLIGHT_BRIGHTNESS = 0x80;
-const QMK_RGBLIGHT_EFFECT = 0x81;
-const QMK_RGBLIGHT_EFFECT_SPEED = 0x82;
-const QMK_RGBLIGHT_COLOR = 0x83;
+// Generate cryptographically random nonce
+function generateNonce(): Uint8Array {
+  const nonce = new Uint8Array(NONCE_SIZE);
+  crypto.getRandomValues(nonce);
+  return nonce;
+}
 
-// VialRGB (sub-commands sent via VIA "get/set keyboard value" or as raw Vial)
-const VIALRGB_GET_INFO = 0x40;
-const VIALRGB_GET_MODE = 0x41;
-const VIALRGB_GET_SUPPORTED = 0x42;
-const VIALRGB_SET_MODE = 0x41;
+export class ViableUSB {
+  // VIA command constants (unchanged, used via wrapper)
+  static readonly CMD_VIA_GET_PROTOCOL_VERSION = 0x01;
+  static readonly CMD_VIA_GET_KEYBOARD_VALUE = 0x02;
+  static readonly CMD_VIA_SET_KEYBOARD_VALUE = 0x03;
+  static readonly CMD_VIA_GET_KEYCODE = 0x04;
+  static readonly CMD_VIA_SET_KEYCODE = 0x05;
+  static readonly CMD_VIA_LIGHTING_SET_VALUE = 0x07;
+  static readonly CMD_VIA_LIGHTING_GET_VALUE = 0x08;
+  static readonly CMD_VIA_LIGHTING_SAVE = 0x09;
+  static readonly CMD_VIA_MACRO_GET_COUNT = 0x0c;
+  static readonly CMD_VIA_MACRO_GET_BUFFER_SIZE = 0x0d;
+  static readonly CMD_VIA_MACRO_GET_BUFFER = 0x0e;
+  static readonly CMD_VIA_MACRO_SET_BUFFER = 0x0f;
+  static readonly CMD_VIA_GET_LAYER_COUNT = 0x11;
+  static readonly CMD_VIA_KEYMAP_GET_BUFFER = 0x12;
 
-// Layer color (channel 0, value_id 32..47)
-const LAYER_COLOR_CHANNEL = 0;
-const LAYER_COLOR_VALUE_ID_BASE = 32;
+  static readonly VIA_LAYOUT_OPTIONS = 0x02;
+  static readonly VIA_SWITCH_MATRIX_STATE = 0x03;
 
-export class VialUSB {
-  private device?: HIDDevice;
-  private queue: Promise<void> = Promise.resolve();
-  private listener: (data: ArrayBuffer, ev: HIDInputReportEvent) => void = () => {};
+  static readonly QMK_BACKLIGHT_BRIGHTNESS = 0x09;
+  static readonly QMK_BACKLIGHT_EFFECT = 0x0a;
+  static readonly QMK_RGBLIGHT_BRIGHTNESS = 0x80;
+  static readonly QMK_RGBLIGHT_EFFECT = 0x81;
+  static readonly QMK_RGBLIGHT_EFFECT_SPEED = 0x82;
+  static readonly QMK_RGBLIGHT_COLOR = 0x83;
 
-  public onDisconnect?: () => void;
-  static DEBUG = false;
+  static readonly VIALRGB_GET_INFO = 0x40;
+  static readonly VIALRGB_GET_MODE = 0x41;
+  static readonly VIALRGB_GET_SUPPORTED = 0x42;
+  static readonly VIALRGB_SET_MODE = 0x41;
 
-  // ---- public constants (kept for service-layer compatibility) ----
-  static readonly CMD_VIA_GET_PROTOCOL_VERSION = CMD_VIA_GET_PROTOCOL_VERSION;
-  static readonly CMD_VIA_GET_KEYBOARD_VALUE = CMD_VIA_GET_KEYBOARD_VALUE;
-  static readonly CMD_VIA_SET_KEYBOARD_VALUE = CMD_VIA_SET_KEYBOARD_VALUE;
-  static readonly CMD_VIA_GET_KEYCODE = CMD_VIA_GET_KEYCODE;
-  static readonly CMD_VIA_SET_KEYCODE = CMD_VIA_SET_KEYCODE;
-  static readonly CMD_VIA_LIGHTING_SET_VALUE = CMD_VIA_LIGHTING_SET_VALUE;
-  static readonly CMD_VIA_LIGHTING_GET_VALUE = CMD_VIA_LIGHTING_GET_VALUE;
-  static readonly CMD_VIA_LIGHTING_SAVE = CMD_VIA_LIGHTING_SAVE;
-  static readonly CMD_VIA_MACRO_GET_COUNT = CMD_VIA_MACRO_GET_COUNT;
-  static readonly CMD_VIA_MACRO_GET_BUFFER_SIZE = CMD_VIA_MACRO_GET_BUFFER_SIZE;
-  static readonly CMD_VIA_MACRO_GET_BUFFER = CMD_VIA_MACRO_GET_BUFFER;
-  static readonly CMD_VIA_MACRO_SET_BUFFER = CMD_VIA_MACRO_SET_BUFFER;
-  static readonly CMD_VIA_GET_LAYER_COUNT = CMD_VIA_GET_LAYER_COUNT;
-  static readonly CMD_VIA_KEYMAP_GET_BUFFER = CMD_VIA_KEYMAP_GET_BUFFER;
-
-  static readonly VIA_LAYOUT_OPTIONS = VIA_VALUE_LAYOUT_OPTIONS;
-  static readonly VIA_SWITCH_MATRIX_STATE = VIA_VALUE_SWITCH_MATRIX_STATE;
-
-  static readonly QMK_BACKLIGHT_BRIGHTNESS = QMK_BACKLIGHT_BRIGHTNESS;
-  static readonly QMK_BACKLIGHT_EFFECT = QMK_BACKLIGHT_EFFECT;
-  static readonly QMK_RGBLIGHT_BRIGHTNESS = QMK_RGBLIGHT_BRIGHTNESS;
-  static readonly QMK_RGBLIGHT_EFFECT = QMK_RGBLIGHT_EFFECT;
-  static readonly QMK_RGBLIGHT_EFFECT_SPEED = QMK_RGBLIGHT_EFFECT_SPEED;
-  static readonly QMK_RGBLIGHT_COLOR = QMK_RGBLIGHT_COLOR;
-
-  static readonly VIALRGB_GET_INFO = VIALRGB_GET_INFO;
-  static readonly VIALRGB_GET_MODE = VIALRGB_GET_MODE;
-  static readonly VIALRGB_GET_SUPPORTED = VIALRGB_GET_SUPPORTED;
-  static readonly VIALRGB_SET_MODE = VIALRGB_SET_MODE;
-
-  // Viable-only command IDs (kept as constants so service files compile;
-  // sendViable() will throw at runtime if actually invoked)
+  // Viable command IDs (0xDF protocol)
   static readonly CMD_VIABLE_GET_INFO = 0x00;
   static readonly CMD_VIABLE_TAP_DANCE_GET = 0x01;
   static readonly CMD_VIABLE_TAP_DANCE_SET = 0x02;
@@ -120,11 +79,35 @@ export class VialUSB {
   static readonly CMD_VIABLE_FRAGMENT_GET_SELECTIONS = 0x19;
   static readonly CMD_VIABLE_FRAGMENT_SET_SELECTIONS = 0x1a;
 
-  static readonly VIABLE_UNSUPPORTED_MSG =
-    "Viable-only command invoked on a Vial/VIA-only build. " +
-    "This keyboard does not expose the 0xDF Viable protocol.";
+  // Svalboard-specific constants
+  static readonly SVAL_GET_LEFT_DPI = 0x00;
+  static readonly SVAL_GET_RIGHT_DPI = 0x00;
+  static readonly SVAL_GET_LEFT_SCROLL = 0x00;
+  static readonly SVAL_GET_RIGHT_SCROLL = 0x00;
+  static readonly SVAL_GET_AUTOMOUSE = 0x00;
+  static readonly SVAL_GET_AUTOMOUSE_MS = 0x00;
 
-  // ---- connection lifecycle ----
+  static readonly SVAL_SET_LEFT_DPI = 0x00;
+  static readonly SVAL_SET_RIGHT_DPI = 0x00;
+  static readonly SVAL_SET_LEFT_SCROLL = 0x00;
+  static readonly SVAL_SET_RIGHT_SCROLL = 0x00;
+  static readonly SVAL_SET_AUTOMOUSE = 0x00;
+  static readonly SVAL_SET_AUTOMOUSE_MS = 0x00;
+
+  private device?: HIDDevice;
+  private queue: Promise<void> = Promise.resolve();
+  private listener: (data: ArrayBuffer, ev: HIDInputReportEvent) => void =
+    () => { };
+
+  // Client ID management
+  private clientId: number = 0;
+  private clientTtl: number = DEFAULT_TTL_SECS;
+  private clientIdExpiry: number = 0;
+  private renewalTimer?: ReturnType<typeof setTimeout>;
+  private bootstrapPromise?: Promise<void>; // Prevent concurrent bootstraps
+
+  public onDisconnect?: () => void;
+
   private handleDisconnect = (event: HIDConnectionEvent) => {
     if (this.device && event.device === this.device) {
       console.log("Device disconnected:", event.device.productName);
@@ -136,12 +119,187 @@ export class VialUSB {
   async open(filters: HIDDeviceFilter[]): Promise<boolean> {
     const devices = await navigator.hid.requestDevice({ filters });
     if (devices.length !== 1) return false;
+
     this.device = devices[0];
-    if (!this.device.opened) await this.device.open();
+    if (!this.device.opened) {
+      await this.device.open();
+    }
     await this.initListener();
     navigator.hid.addEventListener("disconnect", this.handleDisconnect);
+
+    // Don't bootstrap here - do it lazily on first command
+    // This helps debug connection issues
     console.log("USB device opened:", this.device.productName);
+
     return true;
+  }
+
+  /**
+   * Check if the device is a Viable keyboard by checking serial number
+   * TODO: Implement proper detection by checking "viable:" prefix in USB serial
+   */
+  isViableDevice(): boolean {
+    // For now, assume viable if connected
+    // Real detection would check USB serial string for "viable:" prefix
+    return true;
+  }
+
+  /**
+   * Ensure we have a valid client ID, bootstrapping if needed
+   */
+  private async ensureClientId(): Promise<void> {
+    // If bootstrap already in progress, wait for it
+    if (this.bootstrapPromise) {
+      await this.bootstrapPromise;
+      return;
+    }
+
+    if (this.clientId === 0 || Date.now() >= this.clientIdExpiry) {
+      console.log("Bootstrapping client ID...");
+      this.bootstrapPromise = this.bootstrapClientId();
+      try {
+        await this.bootstrapPromise;
+      } finally {
+        this.bootstrapPromise = undefined;
+      }
+    }
+  }
+
+  /**
+   * Bootstrap a client ID from the keyboard
+   * Request: [0xDD][0x00000000][nonce:20]
+   * Response: [0xDD][0x00000000][nonce:20][new_client_id:4][ttl:2]
+   */
+  private async bootstrapClientId(): Promise<void> {
+    if (!this.device) throw new Error("USB device not connected");
+
+    const nonce = generateNonce();
+
+    const message = new Uint8Array(MSG_LEN);
+    message[0] = WRAPPER_PREFIX;
+    // Client ID = 0 (bootstrap)
+    message[1] = 0;
+    message[2] = 0;
+    message[3] = 0;
+    message[4] = 0;
+    // Nonce
+    message.set(nonce, 5);
+
+    console.log("Bootstrap request:", Array.from(message.slice(0, 30)).map(b => b.toString(16).padStart(2, '0')).join(' '));
+
+    // Send bootstrap request and wait for OUR response (might get other clients' responses first)
+    const maxAttempts = 5;
+    const maxReadsPerAttempt = 50;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Send the bootstrap request
+      await this.device!.sendReport(0, message as BufferSource);
+
+      // Read responses until we find ours or timeout
+      for (let read = 0; read < maxReadsPerAttempt; read++) {
+        const response = await this.readWithTimeout(500);
+        if (!response) {
+          console.log("Bootstrap read timeout, retrying send...");
+          break; // Timeout - retry the send
+        }
+
+        console.log("Bootstrap response:", Array.from(response.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join(' '));
+
+        // Validate wrapper prefix
+        if (response[0] !== WRAPPER_PREFIX) {
+          console.log("Unexpected response prefix, reading again...");
+          continue;
+        }
+
+        // Check if client ID is 0 (bootstrap response)
+        const respClientId = response[1] | (response[2] << 8) | (response[3] << 16) | (response[4] << 24);
+        if (respClientId !== 0) {
+          console.log(`Discarding response for client 0x${respClientId.toString(16)}, reading again...`);
+          continue;
+        }
+
+        // Verify nonce echo (bytes 5-24)
+        let nonceMatch = true;
+        for (let i = 0; i < NONCE_SIZE; i++) {
+          if (response[5 + i] !== nonce[i]) {
+            nonceMatch = false;
+            break;
+          }
+        }
+        if (!nonceMatch) {
+          console.log("Nonce mismatch (another client's response), reading again...");
+          continue;
+        }
+
+        // Extract client ID (bytes 25-28, little-endian)
+        const newClientId = response[25] |
+          (response[26] << 8) |
+          (response[27] << 16) |
+          (response[28] << 24);
+
+        // Check for error
+        if (newClientId === 0xFFFFFFFF) {
+          const errorCode = response[29];
+          throw new Error(`Bootstrap failed with error code ${errorCode}`);
+        }
+
+        this.clientId = newClientId;
+
+        // Extract TTL (bytes 29-30, little-endian)
+        this.clientTtl = response[29] | (response[30] << 8);
+
+        // Set expiry time (with 10% buffer for renewal)
+        this.clientIdExpiry = Date.now() + (this.clientTtl * 900); // 90% of TTL
+
+        // Schedule renewal
+        this.scheduleRenewal();
+
+        console.log(`Viable client ID bootstrapped: 0x${this.clientId.toString(16)}, TTL: ${this.clientTtl}s`);
+        return;
+      }
+    }
+
+    throw new Error("Bootstrap failed after all retries");
+  }
+
+  /**
+   * Read a single HID report with timeout
+   */
+  private readWithTimeout(timeoutMs: number): Promise<Uint8Array | null> {
+    return new Promise((resolve) => {
+      const timeoutId = setTimeout(() => {
+        this.device?.removeEventListener("inputreport", handler);
+        resolve(null);
+      }, timeoutMs);
+
+      const handler = (ev: HIDInputReportEvent) => {
+        clearTimeout(timeoutId);
+        this.device?.removeEventListener("inputreport", handler);
+        resolve(new Uint8Array(ev.data.buffer));
+      };
+
+      this.device?.addEventListener("inputreport", handler);
+    });
+  }
+
+  /**
+   * Schedule client ID renewal before expiry
+   */
+  private scheduleRenewal(): void {
+    if (this.renewalTimer) {
+      clearTimeout(this.renewalTimer);
+    }
+
+    const renewIn = this.clientIdExpiry - Date.now();
+    if (renewIn > 0) {
+      this.renewalTimer = setTimeout(async () => {
+        try {
+          await this.bootstrapClientId();
+        } catch (e) {
+          console.error("Failed to renew client ID:", e);
+        }
+      }, renewIn);
+    }
   }
 
   getDeviceName(): string | null {
@@ -149,11 +307,18 @@ export class VialUSB {
   }
 
   async close(): Promise<void> {
-    if (this.handleEvent) {
-      this.device?.removeEventListener("inputreport", this.handleEvent);
-      this.handleEvent = undefined;
+    if (this.renewalTimer) {
+      clearTimeout(this.renewalTimer);
+      this.renewalTimer = undefined;
     }
+    this.clientId = 0;
+    this.clientIdExpiry = 0;
+
     if (this.device) {
+      if (this.handleEvent) {
+        this.device.removeEventListener("inputreport", this.handleEvent);
+        this.handleEvent = undefined;
+      }
       await this.device.close();
       this.device = undefined;
     }
@@ -166,145 +331,401 @@ export class VialUSB {
     if (!this.device) return;
     const handleEvent = (ev: HIDInputReportEvent) => {
       if (this.listener) {
-        this.listener(ev.data.buffer as ArrayBuffer, ev);
+        const buffer = ev.data.buffer as ArrayBuffer;
+        this.listener(buffer, ev);
       }
     };
     this.handleEvent = handleEvent;
     this.device.addEventListener("inputreport", handleEvent);
   }
 
-  // ---- message building ----
   /**
-   * Build a 32-byte HID report for QMK-VIA / Vial.
-   *   report[0] = command ID
-   *   report[1..] = arguments
-   *   remainder  = zero (already zero from Uint8Array constructor)
+   * Build wrapped message with client ID
+   * Format: [0xDD][client_id:4][protocol][payload...]
    */
-  private buildMessage(cmd: number, args: number[]): Uint8Array {
-    const msg = new Uint8Array(MSG_LEN);
-    msg[0] = cmd;
-    for (let i = 0; i < args.length && i < MSG_LEN - 1; i++) {
-      msg[1 + i] = args[i];
+  private buildWrappedMessage(protocol: number, payload: number[]): Uint8Array {
+    const message = new Uint8Array(MSG_LEN);
+    message[0] = WRAPPER_PREFIX;
+    // Client ID (little-endian)
+    message[1] = this.clientId & 0xff;
+    message[2] = (this.clientId >> 8) & 0xff;
+    message[3] = (this.clientId >> 16) & 0xff;
+    message[4] = (this.clientId >> 24) & 0xff;
+    // Protocol
+    message[5] = protocol;
+    // Payload
+    for (let i = 0; i < payload.length && i < MSG_LEN - 6; i++) {
+      message[6 + i] = payload[i];
     }
-    if (VialUSB.DEBUG) {
-      const hex = Array.from(msg.slice(0, 8))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join(" ");
-      console.log(`[VIA] TX cmd=0x${cmd.toString(16)} : ${hex}`);
-    }
-    return msg;
+    return message;
   }
 
-  // ---- public send ----
+  /**
+   * Parse wrapped response, stripping wrapper header
+   * Input: [0xDD][client_id:4][protocol][payload...]
+   * Output: payload starting after protocol byte
+   */
+  private parseWrappedResponse(data: ArrayBuffer, options: USBSendOptions): Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[] {
+    const u8 = new Uint8Array(data);
+
+    // Verify wrapper prefix
+    if (u8[0] !== WRAPPER_PREFIX) {
+      throw new Error("Invalid response wrapper prefix");
+    }
+
+    // Verify client ID matches
+    const responseClientId = u8[1] | (u8[2] << 8) | (u8[3] << 16) | (u8[4] << 24);
+    if (responseClientId !== this.clientId) {
+      throw new Error("Response client ID mismatch");
+    }
+
+    // Extract payload (skip wrapper header + protocol byte = 6 bytes)
+    const payloadBuffer = data.slice(6);
+    return this.parseResponse(payloadBuffer, options);
+  }
+
+  // Overload signatures for send() - sends VIA commands via wrapper
+  async send(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index: number }): Promise<number | bigint>;
+  async send(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index?: undefined }): Promise<(number | bigint)[]>;
+  async send(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index: number }): Promise<number>;
+  async send(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index?: undefined }): Promise<Uint8Array>;
+  async send(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index: number }): Promise<number>;
+  async send(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index?: undefined }): Promise<Uint16Array>;
+  async send(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index: number }): Promise<number>;
+  async send(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index?: undefined }): Promise<Uint32Array>;
+  async send(cmd: number, args: number[], options?: USBSendOptions): Promise<Uint8Array>;
+
+  /**
+   * Send VIA command via wrapper
+   * Wraps: [0xDD][client_id:4][0xFE][via_cmd][args...]
+   */
   async send(
     cmd: number,
     args: number[],
     options: USBSendOptions = {}
-  ): Promise<Uint8Array> {
+  ): Promise<Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[]> {
     if (!this.device) throw new Error("USB device not connected");
 
-    const message = this.buildMessage(cmd, args);
+    // Ensure we have a valid client ID
+    await this.ensureClientId();
 
-    const operation = this.queue.then(
-      () =>
-        new Promise<Uint8Array>((resolve, reject) => {
-          const timeoutId = setTimeout(() => {
-            console.warn(
-              "USB Command Timed out waiting for valid response:",
-              cmd
-            );
-            reject(new Error("USB Command Timeout"));
-          }, 1000);
+    // Build VIA command payload
+    const payload = [cmd, ...args];
+    const message = this.buildWrappedMessage(VIA_PREFIX, payload);
 
-          this.listener = (data: ArrayBuffer) => {
-            const u8 = new Uint8Array(data);
+    // Queue the operations to prevent listener collision
+    const operation = this.queue.then(async () => {
+      return new Promise<Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[]>((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          console.warn("USB Command Timed out waiting for valid response:", cmd);
+          reject(new Error("USB Command Timeout"));
+        }, 1000);
 
-            // QMK-VIA echo rule: report[0] is the command ID echoed back.
-            if (u8[0] !== cmd) return;
+        this.listener = (data: ArrayBuffer) => {
+          const u8 = new Uint8Array(data);
 
-            if (options.validateInput) {
-              if (!options.validateInput(u8)) return;
+          // Validation: check wrapper prefix and client ID
+          if (u8[0] !== WRAPPER_PREFIX) return;
+          const respClientId = u8[1] | (u8[2] << 8) | (u8[3] << 16) | (u8[4] << 24);
+          if (respClientId !== this.clientId) return;
+
+          // Additional validation if provided
+          if (options.validateInput) {
+            // Pass unwrapped data to validator
+            const unwrapped = new Uint8Array(data.slice(6));
+            if (!options.validateInput(unwrapped)) {
+              return;
             }
+          }
 
-            if (VialUSB.DEBUG) {
-              const hex = Array.from(u8.slice(0, 8))
-                .map((b) => b.toString(16).padStart(2, "0"))
-                .join(" ");
-              console.log(`[VIA] RX cmd=0x${cmd.toString(16)} : ${hex}`);
-            }
+          clearTimeout(timeoutId);
+          try {
+            const result = this.parseWrappedResponse(data, options);
+            resolve(result);
+          } catch (e) {
+            reject(e);
+          }
+        };
 
-            clearTimeout(timeoutId);
-            try {
-              const result = this.parseResponse(data, options);
-              resolve(result as Uint8Array);
-            } catch (e) {
-              reject(e);
-            }
-          };
-
-          this.device!.sendReport(0, message as BufferSource).catch((err: unknown) => {
-            clearTimeout(timeoutId);
-            reject(err);
-          });
-        })
-    );
+        this.device!.sendReport(0, message as BufferSource).catch(err => {
+          clearTimeout(timeoutId);
+          reject(err);
+        });
+      });
+    });
 
     this.queue = operation.then(() => undefined).catch(() => undefined);
     return operation;
   }
 
+  // Overload signatures for sendViable()
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index: number }): Promise<number | bigint>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index?: undefined }): Promise<(number | bigint)[]>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index: number }): Promise<number>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index?: undefined }): Promise<Uint8Array>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index: number }): Promise<number>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index?: undefined }): Promise<Uint16Array>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index: number }): Promise<number>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index?: undefined }): Promise<Uint32Array>;
+  async sendViable(cmd: number, args: number[], options?: USBSendOptions): Promise<Uint8Array>;
+
   /**
-   * sendViable: Viable-only commands (0xDF protocol) are NOT supported by
-   * standard QMK-VIA / Vial firmware. This stub exists so service files that
-   * reference usb.sendViable(...) continue to compile. At runtime it throws
-   * a clear error if a Viable-only feature is actually triggered.
+   * Send Viable command via wrapper
+   * Wraps: [0xDD][client_id:4][0xDF][viable_cmd][args...]
    */
   async sendViable(
     cmd: number,
     args: number[],
-    _options: USBSendOptions = {}
-  ): Promise<never> {
-    console.warn(
-      `sendViable called (cmd=0x${cmd.toString(16)}, args=${JSON.stringify(args)})`
-    );
-    throw new Error(VialUSB.VIABLE_UNSUPPORTED_MSG);
+    options: USBSendOptions = {}
+  ): Promise<Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[]> {
+    if (!this.device) throw new Error("USB device not connected");
+
+    // Ensure we have a valid client ID
+    await this.ensureClientId();
+
+    // Build Viable command payload
+    const payload = [cmd, ...args];
+    const message = this.buildWrappedMessage(VIABLE_PREFIX, payload);
+
+    // Queue the operations
+    const operation = this.queue.then(async () => {
+      return new Promise<Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[]>((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          console.warn("Viable Command Timed out:", cmd);
+          reject(new Error("USB Command Timeout"));
+        }, 1000);
+
+        this.listener = (data: ArrayBuffer) => {
+          const u8 = new Uint8Array(data);
+
+          // Validation: check wrapper prefix and client ID
+          if (u8[0] !== WRAPPER_PREFIX) return;
+          const respClientId = u8[1] | (u8[2] << 8) | (u8[3] << 16) | (u8[4] << 24);
+          if (respClientId !== this.clientId) return;
+
+          // Check for error response (protocol byte = 0xFF)
+          if (u8[5] === 0xFF) {
+            clearTimeout(timeoutId);
+            const errorCode = u8[6];
+            reject(new Error(`Viable protocol error: code ${errorCode}`));
+            return;
+          }
+
+          // Additional validation if provided
+          if (options.validateInput) {
+            const unwrapped = new Uint8Array(data.slice(6));
+            if (!options.validateInput(unwrapped)) {
+              return;
+            }
+          }
+
+          clearTimeout(timeoutId);
+          try {
+            const result = this.parseWrappedResponse(data, options);
+            resolve(result);
+          } catch (e) {
+            reject(e);
+          }
+        };
+
+        this.device!.sendReport(0, message as BufferSource).catch(err => {
+          clearTimeout(timeoutId);
+          reject(err);
+        });
+      });
+    });
+
+    this.queue = operation.then(() => undefined).catch(() => undefined);
+    return operation;
   }
 
-  // ---- response parsing ----
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions): Uint8Array {
+  // Overload signatures for type safety
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { unpack: string; index: number }): number | bigint;
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { unpack: string; index?: undefined }): (number | bigint)[];
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint8: true; index: number }): number;
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint8: true; index?: undefined }): Uint8Array;
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint16: true; index: number }): number;
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint16: true; index?: undefined }): Uint16Array;
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint32: true; index: number }): number;
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint32: true; index?: undefined }): Uint32Array;
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions): Uint8Array;
+
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions): Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[] {
     const skipBytes = options.skipBytes || 0;
+    const dv = new DataView(data);
     const u8 = new Uint8Array(data);
 
-    if (options.uint8) {
-      const sliced = skipBytes > 0 ? u8.slice(skipBytes) : u8;
-      return sliced;
+    if (options.unpack) {
+      // For unpack, create a new DataView starting at skipBytes offset
+      const offsetDv = skipBytes > 0 ? new DataView(data, skipBytes) : dv;
+      const unpacked = this.unpackData(offsetDv, options.unpack);
+      if (options.index !== undefined) {
+        return unpacked[options.index];
+      }
+      return unpacked;
     }
 
-    // default: return raw bytes after skipBytes
+    if (options.uint8) {
+      if (options.index !== undefined) {
+        return u8[skipBytes + options.index];
+      }
+      return skipBytes > 0 ? u8.slice(skipBytes) : u8;
+    }
+
+    if (options.uint16) {
+      const littleEndian = !options.bigendian;
+      if (options.index !== undefined) {
+        // index is a byte offset, not an element index
+        return dv.getUint16(skipBytes + options.index, littleEndian);
+      }
+      // Read uint16 values using DataView to handle odd byte offsets
+      const numValues = Math.floor((data.byteLength - skipBytes) / 2);
+      const values: number[] = [];
+      for (let i = 0; i < numValues; i++) {
+        values.push(dv.getUint16(skipBytes + i * 2, littleEndian));
+      }
+      let u16Array = new Uint16Array(values);
+      if (options.slice !== undefined) {
+        u16Array = u16Array.slice(options.slice);
+      }
+      return u16Array;
+    }
+
+    if (options.uint32) {
+      const littleEndian = !options.bigendian;
+      if (options.index !== undefined) {
+        // index is a byte offset, not an element index
+        return dv.getUint32(skipBytes + options.index, littleEndian);
+      }
+      // Read uint32 values using DataView to handle odd byte offsets
+      const numValues = Math.floor((data.byteLength - skipBytes) / 4);
+      const values: number[] = [];
+      for (let i = 0; i < numValues; i++) {
+        values.push(dv.getUint32(skipBytes + i * 4, littleEndian));
+      }
+      return new Uint32Array(values);
+    }
+
     return skipBytes > 0 ? u8.slice(skipBytes) : u8;
   }
 
-  // ---- buffered transfer (VIA 22-byte chunks) ----
+  private unpackData(dv: DataView, format: string): (number | bigint)[] {
+    const results: (number | bigint)[] = [];
+    let offset = 0;
+    let littleEndian = true;
+
+    if (format.includes("<")) littleEndian = true;
+    if (format.includes(">")) littleEndian = false;
+
+    const formatChars = format.replace(/[<>]/g, "");
+
+    for (const char of formatChars) {
+      switch (char) {
+        case "B":
+          results.push(dv.getUint8(offset));
+          offset += 1;
+          break;
+        case "H":
+          results.push(dv.getUint16(offset, littleEndian));
+          offset += 2;
+          break;
+        case "I":
+          results.push(dv.getUint32(offset, littleEndian));
+          offset += 4;
+          break;
+        case "Q":
+          results.push(dv.getBigUint64(offset, littleEndian));
+          offset += 8;
+          break;
+      }
+    }
+
+    return results;
+  }
+
   async getViaBuffer(
     cmd: number,
     size: number,
-    options: USBSendOptions = {}
-  ): Promise<Uint8Array> {
-    const chunksize = 22; // VIA payload per report
+    options: USBSendOptions = {},
+    checkComplete?: (data: number[] | Uint8Array) => boolean
+  ): Promise<number[] | Uint8Array> {
+    // VIA_BUFFER_CHUNK_SIZE = 22 (32 total - 6 wrapper - 4 VIA response header)
+    const chunksize = 22;
+    const bytes = options.bytes || 1;
     const alldata: number[] = [];
     let offset = 0;
 
     while (offset < size) {
-      const sz = Math.min(chunksize, size - offset);
-      // VIA offset is big-endian 16-bit
-      const args = [
-        (offset >> 8) & 0xff,
-        offset & 0xff,
-        sz,
-      ];
-      const data = (await this.send(cmd, args, options)) as unknown as Uint8Array;
-      for (let i = 0; i < data.length; i++) alldata.push(data[i]);
-      offset += sz;
+      let sz = chunksize;
+      if (sz > size - offset) {
+        sz = size - offset;
+      }
+
+      const args = [...BE16(offset), sz];
+      const data = await this.send(cmd, args, options) as Uint8Array;
+
+      if (sz < chunksize) {
+        const sliceSize = Math.floor(sz / bytes);
+        alldata.push(...Array.from(data).slice(0, sliceSize));
+      } else {
+        if (Array.isArray(data)) {
+          alldata.push(...data);
+        } else {
+          alldata.push(...Array.from(data));
+        }
+      }
+
+      if (checkComplete && checkComplete(alldata)) {
+        break;
+      }
+
+      offset += chunksize;
+    }
+
+    if (options.uint16) {
+      return alldata;
+    }
+
+    return new Uint8Array(alldata);
+  }
+
+  /**
+   * Get keyboard definition via Viable protocol
+   * Uses CMD_VIABLE_DEFINITION_SIZE and CMD_VIABLE_DEFINITION_CHUNK
+   */
+  async getViableDefinition(): Promise<Uint8Array> {
+    // Get definition size
+    // Response format after wrapper stripped: [cmd_echo][size0][size1][size2][size3]
+    const sizeResp = await this.sendViable(
+      ViableUSB.CMD_VIABLE_DEFINITION_SIZE,
+      [],
+      { uint32: true, index: 1 } // Skip cmd_echo
+    );
+    const size = sizeResp as number;
+
+    // Fetch definition in chunks
+    // VIABLE_DEFINITION_CHUNK_SIZE = 22 (32 total - 6 wrapper - 4 response header)
+    const chunkSize = 22;
+    const alldata: number[] = [];
+    let offset = 0;
+
+    while (offset < size) {
+      const requestSize = Math.min(chunkSize, size - offset);
+      const resp = await this.sendViable(
+        ViableUSB.CMD_VIABLE_DEFINITION_CHUNK,
+        [...LE16(offset), requestSize],
+        { uint8: true }
+      );
+
+      const data = resp as Uint8Array;
+      // Response format after wrapper stripped: [cmd_echo][offset_lo][offset_hi][actual_size][data...]
+      const actualSize = data[3]; // Skip cmd_echo
+      for (let i = 0; i < actualSize; i++) {
+        alldata.push(data[4 + i]); // Skip cmd_echo + header
+      }
+
+      offset += actualSize;
+      if (actualSize < requestSize) break; // End of data
     }
 
     return new Uint8Array(alldata);
@@ -316,96 +737,142 @@ export class VialUSB {
     data: ArrayBuffer
   ): Promise<void> {
     const buffer = new Uint8Array(data);
-    const chunkSize = 22;
     let offset = 0;
     let chunkOffset = 0;
+    // VIA_BUFFER_CHUNK_SIZE = 22 (matches get chunk size)
+    const chunkSize = 22;
 
     while (offset < size) {
       const chunk = new Uint8Array(chunkSize);
       for (let i = 0; i < chunk.length && offset < size; i++) {
         chunk[i] = buffer[offset++];
       }
-      await this.send(cmd, [
-        chunkOffset & 0xff,
-        (chunkOffset >> 8) & 0xff,
-        ...Array.from(chunk),
-      ], {});
+
+      await this.send(cmd, [...LE16(chunkOffset), ...chunk], {});
       chunkOffset += chunk.length;
     }
   }
 
-  // ---- Viable definition (not supported in VIA-only build) ----
-  async getViableDefinition(): Promise<Uint8Array> {
-    throw new Error(VialUSB.VIABLE_UNSUPPORTED_MSG);
+  // Overload signatures for getViableEntries()
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { unpack: string; index: number }): Promise<(number | bigint)[]>;
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { unpack: string; index?: undefined }): Promise<(number | bigint)[][]>;
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { uint8: true; index: number }): Promise<number[]>;
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { uint8: true; index?: undefined }): Promise<Uint8Array[]>;
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { uint16: true; index: number }): Promise<number[]>;
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { uint16: true; index?: undefined }): Promise<Uint16Array[]>;
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { uint32: true; index: number }): Promise<number[]>;
+  async getViableEntries(getCmd: number, count: number, options: USBSendOptions & { uint32: true; index?: undefined }): Promise<Uint32Array[]>;
+  async getViableEntries(getCmd: number, count: number, options?: USBSendOptions): Promise<Uint8Array[]>;
+
+  /**
+   * Get multiple entries using Viable protocol
+   */
+  async getViableEntries(
+    getCmd: number,
+    count: number,
+    options: USBSendOptions = {}
+  ): Promise<(Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[])[]> {
+    const entries: (Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[])[] = [];
+    for (let i = 0; i < count; i++) {
+      const data = await this.sendViable(getCmd, [i], options);
+      entries.push(data);
+    }
+    return entries;
   }
 
-  // ---- custom value protocol (0x07 / 0x08 / 0x09) ----
-  async customValueGet(
-    channel: number,
-    valueId: number,
-    size: number = 2
-  ): Promise<Uint8Array> {
-    const resp = (await this.send(
-      CMD_VIA_LIGHTING_GET_VALUE,
+  // VIA Custom Value Protocol (0x07/0x08/0x09)
+  // Channels: 0 = keyboard-specific, 1 = QMK backlight, 2 = QMK rgblight
+
+  /**
+   * Get a custom value from the keyboard using VIA custom value protocol.
+   * Packet: [0x08][channel][value_id]
+   * Response: [0x08][channel][value_id][data...]
+   */
+  async customValueGet(channel: number, valueId: number, size: number = 2): Promise<Uint8Array> {
+    const resp = await this.send(
+      ViableUSB.CMD_VIA_LIGHTING_GET_VALUE,
       [channel, valueId],
       {
         uint8: true,
-        skipBytes: 3, // skip cmd_echo + channel + value_id
+        skipBytes: 3, // Skip cmd_echo, channel, value_id
+        // Only resolve on the report that echoes THIS request. Without this,
+        // the listener accepts any wrapper/clientId-matched report, so a stray or
+        // duplicated report (common on the first connect after a reboot, when the
+        // WebHID buffer holds a leftover reply) can be consumed by the wrong
+        // customValueGet in the sequential read loop, shifting every subsequent
+        // read by one slot and showing a neighboring value's data (e.g. right-hand
+        // DPI reading as 1200 when the device holds 400).
         validateInput: (u) =>
-          u[0] === CMD_VIA_LIGHTING_GET_VALUE &&
+          u[0] === ViableUSB.CMD_VIA_LIGHTING_GET_VALUE &&
           u[1] === channel &&
           u[2] === valueId,
       }
-    )) as unknown as Uint8Array;
-    return resp.slice(0, size);
+    );
+    return (resp as Uint8Array).slice(0, size);
   }
 
-  async customValueSet(
-    channel: number,
-    valueId: number,
-    data: number[]
-  ): Promise<void> {
-    console.log(
-      `customValueSet: channel=${channel}, valueId=${valueId}, data=[${data.join(", ")}]`
-    );
+  /**
+   * Set a custom value on the keyboard using VIA custom value protocol.
+   * Packet: [0x07][channel][value_id][data...]
+   */
+  async customValueSet(channel: number, valueId: number, data: number[]): Promise<void> {
+    console.log(`customValueSet: channel=${channel}, valueId=${valueId}, data=[${data.join(', ')}]`);
     await this.send(
-      CMD_VIA_LIGHTING_SET_VALUE,
+      ViableUSB.CMD_VIA_LIGHTING_SET_VALUE,
       [channel, valueId, ...data],
       {}
     );
   }
 
+  /**
+   * Save custom values to EEPROM using VIA custom value protocol.
+   * Packet: [0x09][channel]
+   */
   async customValueSave(channel: number): Promise<void> {
-    await this.send(CMD_VIA_LIGHTING_SAVE, [channel], {});
+    await this.send(
+      ViableUSB.CMD_VIA_LIGHTING_SAVE,
+      [channel],
+      {}
+    );
   }
 
-  // ---- layer color helpers (channel 0, value_id 32..47) ----
-  async getLayerColor(
-    layer: number
-  ): Promise<{ hue: number; sat: number }> {
-    const valueId = LAYER_COLOR_VALUE_ID_BASE + layer;
-    const data = await this.customValueGet(LAYER_COLOR_CHANNEL, valueId, 2);
+  // Layer Color convenience methods (channel 0, value_ids 32-47)
+  // Color format: 2 bytes [hue, sat] (0-255 range, QMK HSV)
+
+  static readonly LAYER_COLOR_VALUE_ID_BASE = 32;
+  static readonly LAYER_COLOR_CHANNEL = 0;
+
+  /**
+   * Get layer color from keyboard.
+   * Returns HSV (hue, sat) - value/brightness controlled separately.
+   */
+  async getLayerColor(layer: number): Promise<{ hue: number; sat: number }> {
+    const valueId = ViableUSB.LAYER_COLOR_VALUE_ID_BASE + layer;
+    const data = await this.customValueGet(ViableUSB.LAYER_COLOR_CHANNEL, valueId, 2);
     return { hue: data[0], sat: data[1] };
   }
 
-  async setLayerColor(
-    layer: number,
-    hue: number,
-    sat: number
-  ): Promise<void> {
-    const valueId = LAYER_COLOR_VALUE_ID_BASE + layer;
-    console.log(
-      `setLayerColor: layer=${layer}, valueId=${valueId}, hue=${hue}, sat=${sat}`
-    );
-    await this.customValueSet(LAYER_COLOR_CHANNEL, valueId, [hue, sat]);
-    await this.customValueSave(LAYER_COLOR_CHANNEL);
+  /**
+   * Set layer color on keyboard.
+   * Takes HSV values (0-255 range).
+   */
+  async setLayerColor(layer: number, hue: number, sat: number): Promise<void> {
+    const valueId = ViableUSB.LAYER_COLOR_VALUE_ID_BASE + layer;
+    console.log(`setLayerColor: layer=${layer}, valueId=${valueId}, hue=${hue}, sat=${sat}`);
+    await this.customValueSet(ViableUSB.LAYER_COLOR_CHANNEL, valueId, [hue, sat]);
+    await this.customValueSave(ViableUSB.LAYER_COLOR_CHANNEL);
   }
 
+  /**
+   * Get all layer colors (for initial sync).
+   * Returns array of 16 HSV values.
+   */
   async getAllLayerColors(): Promise<Array<{ hue: number; sat: number }>> {
     const colors: Array<{ hue: number; sat: number }> = [];
     for (let i = 0; i < 16; i++) {
       try {
-        colors.push(await this.getLayerColor(i));
+        const color = await this.getLayerColor(i);
+        colors.push(color);
       } catch {
         colors.push({ hue: 0, sat: 0 });
       }
@@ -414,6 +881,8 @@ export class VialUSB {
   }
 }
 
-// ---- exports ----
-export const usbInstance = new VialUSB();
-export { VialUSB as ViableUSB };
+// Export singleton instance
+export const usbInstance = new ViableUSB();
+
+// Backward compatibility alias
+export { ViableUSB as VialUSB };
