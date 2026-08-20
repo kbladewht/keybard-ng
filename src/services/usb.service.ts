@@ -39,6 +39,37 @@ export class VialUSB {
   static readonly VIALRGB_GET_SUPPORTED = 0x42;
   static readonly VIALRGB_SET_MODE = 0x41;
 
+  // ---- Viable-only command constants (kept for service-layer compile compatibility) ----
+  // These commands are NOT part of standard VIA/Vial. They are emitted by Viable
+  // firmware behind a 0xDD wrapper, which this Vial-only build does not support.
+  // Calling sendViable() at runtime will throw a clear error.
+  static readonly CMD_VIABLE_GET_INFO = 0x00;
+  static readonly CMD_VIABLE_TAP_DANCE_GET = 0x01;
+  static readonly CMD_VIABLE_TAP_DANCE_SET = 0x02;
+  static readonly CMD_VIABLE_COMBO_GET = 0x03;
+  static readonly CMD_VIABLE_COMBO_SET = 0x04;
+  static readonly CMD_VIABLE_KEY_OVERRIDE_GET = 0x05;
+  static readonly CMD_VIABLE_KEY_OVERRIDE_SET = 0x06;
+  static readonly CMD_VIABLE_ALT_REPEAT_KEY_GET = 0x07;
+  static readonly CMD_VIABLE_ALT_REPEAT_KEY_SET = 0x08;
+  static readonly CMD_VIABLE_ONE_SHOT_GET = 0x09;
+  static readonly CMD_VIABLE_ONE_SHOT_SET = 0x0a;
+  static readonly CMD_VIABLE_SAVE = 0x0b;
+  static readonly CMD_VIABLE_RESET = 0x0c;
+  static readonly CMD_VIABLE_DEFINITION_SIZE = 0x0d;
+  static readonly CMD_VIABLE_DEFINITION_CHUNK = 0x0e;
+  static readonly CMD_VIABLE_QMK_SETTINGS_QUERY = 0x10;
+  static readonly CMD_VIABLE_QMK_SETTINGS_GET = 0x11;
+  static readonly CMD_VIABLE_QMK_SETTINGS_SET = 0x12;
+  static readonly CMD_VIABLE_QMK_SETTINGS_RESET = 0x13;
+  static readonly CMD_VIABLE_LEADER_GET = 0x14;
+  static readonly CMD_VIABLE_LEADER_SET = 0x15;
+  static readonly CMD_VIABLE_LAYER_STATE_GET = 0x16;
+  static readonly CMD_VIABLE_LAYER_STATE_SET = 0x17;
+  static readonly CMD_VIABLE_FRAGMENT_GET_HARDWARE = 0x18;
+  static readonly CMD_VIABLE_FRAGMENT_GET_SELECTIONS = 0x19;
+  static readonly CMD_VIABLE_FRAGMENT_SET_SELECTIONS = 0x1a;
+
   private device?: HIDDevice;
   private queue: Promise<void> = Promise.resolve();
   private listener: (data: ArrayBuffer, ev: HIDInputReportEvent) => void = () => {};
@@ -175,6 +206,36 @@ export class VialUSB {
     return operation;
   }
 
+  // ---- sendViable (compile-compatible stub) ---------------------------------
+  // Viable-only commands (Tap Dance / Combo / Key Override / QMK Settings /
+  // Fragment / Alt-Repeat / Leader / One-Shot / Viable Definition / Save /
+  // Reset) are NOT part of standard VIA/Vial. This build is Vial-only, so we
+  // keep the API surface so existing services compile, but invoking it at
+  // runtime throws a clear, actionable error instead of silently misbehaving.
+
+  static get VIABLE_UNSUPPORTED_MSG(): string {
+    return (
+      "Viable-only command called on a Vial-only build. " +
+      "Tap Dance / Combo / Key Override / QMK Settings / Fragment / " +
+      "Alt-Repeat / Leader / One-Shot / Viable Definition / Save / Reset " +
+      "require Viable firmware and are not supported here."
+    );
+  }
+
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index: number }): Promise<number | bigint>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index?: undefined }): Promise<(number | bigint)[]>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index: number }): Promise<number>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index?: undefined }): Promise<Uint8Array>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index: number }): Promise<number>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index?: undefined }): Promise<Uint16Array>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index: number }): Promise<number>;
+  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index?: undefined }): Promise<Uint32Array>;
+  async sendViable(cmd: number, args: number[], options?: USBSendOptions): Promise<Uint8Array>;
+  async sendViable(cmd: number, args: number[], _options: USBSendOptions = {}): Promise<never> {
+    void cmd; void args;
+    throw new Error(VialUSB.VIABLE_UNSUPPORTED_MSG);
+  }
+
   // ---- response parsing ----------------------------------------------------
 
   private parseResponse(data: ArrayBuffer, options: USBSendOptions & { unpack: string; index: number }): number | bigint;
@@ -301,7 +362,7 @@ export class VialUSB {
 
       // BE16(offset) = two bytes, big-endian offset, then size
       const args = [((offset >> 8) & 0xff), (offset & 0xff), sz];
-      const data = (await this.send(cmd, args, options)) as Uint8Array;
+      const data = (await this.send(cmd, args, options)) as unknown as Uint8Array;
 
       if (sz < chunksize) {
         const sliceSize = Math.floor(sz / bytes);
@@ -362,7 +423,7 @@ export class VialUSB {
           u[2] === valueId,
       }
     );
-    return (resp as Uint8Array).slice(0, size);
+    return (resp as unknown as Uint8Array).slice(0, size);
   }
 
   /**
