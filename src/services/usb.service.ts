@@ -6,6 +6,7 @@ import { MSG_LEN } from "./utils";
 
 const VIA_PREFIX = 0xfe;
 
+
 export class VialUSB {
   // VIA command constants
   static readonly CMD_VIA_GET_PROTOCOL_VERSION = 0x01;
