@@ -1,49 +1,98 @@
-// USB HID communication layer — Vial (QMK-VIA) only
-// Speaks the raw VIA protocol: [0xFE][cmd][args...] / response [0xFE][cmd][data...]
-// No 0xDD client-id wrapper, no bootstrap, no Viable-specific commands.
+/**
+ * ViableUSB / VialUSB - USB HID communication layer for Vial-compatible keyboards
+ *
+ * Protocol: Standard QMK-VIA / Vial raw HID
+ *   Request:  [cmd][args...]          (32 bytes, zero-padded)
+ *   Response: [cmd_echo][data...]     (cmd echoed in byte 0)
+ *
+ * NOTE: The 0xFE "prefix" is NOT sent as a separate byte. In QMK's
+ * raw_hid_receive(), the first byte of the report IS the command ID.
+ * Some Vial GUI tools prepend 0xFE as a host-side framing convention, but
+ * QMK-VIA firmware expects: report[0] = command_id.
+ */
+
 import type { USBSendOptions } from "../types/vial.types";
 import { MSG_LEN } from "./utils";
 
-const VIA_PREFIX = 0xfe;
+// ---- VIA command IDs (QMK-VIA standard) ----
+const CMD_VIA_GET_PROTOCOL_VERSION = 0x01;
+const CMD_VIA_GET_KEYBOARD_VALUE = 0x02;
+const CMD_VIA_SET_KEYBOARD_VALUE = 0x03;
+const CMD_VIA_GET_KEYCODE = 0x04;
+const CMD_VIA_SET_KEYCODE = 0x05;
+const CMD_VIA_LIGHTING_SET_VALUE = 0x07;
+const CMD_VIA_LIGHTING_GET_VALUE = 0x08;
+const CMD_VIA_LIGHTING_SAVE = 0x09;
+const CMD_VIA_MACRO_GET_COUNT = 0x0c;
+const CMD_VIA_MACRO_GET_BUFFER_SIZE = 0x0d;
+const CMD_VIA_MACRO_GET_BUFFER = 0x0e;
+const CMD_VIA_MACRO_SET_BUFFER = 0x0f;
+const CMD_VIA_GET_LAYER_COUNT = 0x11;
+const CMD_VIA_KEYMAP_GET_BUFFER = 0x12;
 
+// VIA "keyboard value" IDs
+const VIA_VALUE_LAYOUT_OPTIONS = 0x02;
+const VIA_VALUE_SWITCH_MATRIX_STATE = 0x03;
+
+// QMK lighting value IDs (channel 1 = backlight, 2 = rgblight)
+const QMK_BACKLIGHT_BRIGHTNESS = 0x09;
+const QMK_BACKLIGHT_EFFECT = 0x0a;
+const QMK_RGBLIGHT_BRIGHTNESS = 0x80;
+const QMK_RGBLIGHT_EFFECT = 0x81;
+const QMK_RGBLIGHT_EFFECT_SPEED = 0x82;
+const QMK_RGBLIGHT_COLOR = 0x83;
+
+// VialRGB (sub-commands sent via VIA "get/set keyboard value" or as raw Vial)
+const VIALRGB_GET_INFO = 0x40;
+const VIALRGB_GET_MODE = 0x41;
+const VIALRGB_GET_SUPPORTED = 0x42;
+const VIALRGB_SET_MODE = 0x41;
+
+// Layer color (channel 0, value_id 32..47)
+const LAYER_COLOR_CHANNEL = 0;
+const LAYER_COLOR_VALUE_ID_BASE = 32;
 
 export class VialUSB {
-  // VIA command constants
-  static readonly CMD_VIA_GET_PROTOCOL_VERSION = 0x01;
-  static readonly CMD_VIA_GET_KEYBOARD_VALUE = 0x02;
-  static readonly CMD_VIA_SET_KEYBOARD_VALUE = 0x03;
-  static readonly CMD_VIA_GET_KEYCODE = 0x04;
-  static readonly CMD_VIA_SET_KEYCODE = 0x05;
-  static readonly CMD_VIA_LIGHTING_SET_VALUE = 0x07;
-  static readonly CMD_VIA_LIGHTING_GET_VALUE = 0x08;
-  static readonly CMD_VIA_LIGHTING_SAVE = 0x09;
-  static readonly CMD_VIA_MACRO_GET_COUNT = 0x0c;
-  static readonly CMD_VIA_MACRO_GET_BUFFER_SIZE = 0x0d;
-  static readonly CMD_VIA_MACRO_GET_BUFFER = 0x0e;
-  static readonly CMD_VIA_MACRO_SET_BUFFER = 0x0f;
-  static readonly CMD_VIA_GET_LAYER_COUNT = 0x11;
-  static readonly CMD_VIA_KEYMAP_GET_BUFFER = 0x12;
+  private device?: HIDDevice;
+  private queue: Promise<void> = Promise.resolve();
+  private listener: (data: ArrayBuffer, ev: HIDInputReportEvent) => void = () => {};
 
-  static readonly VIA_LAYOUT_OPTIONS = 0x02;
-  static readonly VIA_SWITCH_MATRIX_STATE = 0x03;
+  public onDisconnect?: () => void;
+  static DEBUG = false;
 
-  static readonly QMK_BACKLIGHT_BRIGHTNESS = 0x09;
-  static readonly QMK_BACKLIGHT_EFFECT = 0x0a;
-  static readonly QMK_RGBLIGHT_BRIGHTNESS = 0x80;
-  static readonly QMK_RGBLIGHT_EFFECT = 0x81;
-  static readonly QMK_RGBLIGHT_EFFECT_SPEED = 0x82;
-  static readonly QMK_RGBLIGHT_COLOR = 0x83;
+  // ---- public constants (kept for service-layer compatibility) ----
+  static readonly CMD_VIA_GET_PROTOCOL_VERSION = CMD_VIA_GET_PROTOCOL_VERSION;
+  static readonly CMD_VIA_GET_KEYBOARD_VALUE = CMD_VIA_GET_KEYBOARD_VALUE;
+  static readonly CMD_VIA_SET_KEYBOARD_VALUE = CMD_VIA_SET_KEYBOARD_VALUE;
+  static readonly CMD_VIA_GET_KEYCODE = CMD_VIA_GET_KEYCODE;
+  static readonly CMD_VIA_SET_KEYCODE = CMD_VIA_SET_KEYCODE;
+  static readonly CMD_VIA_LIGHTING_SET_VALUE = CMD_VIA_LIGHTING_SET_VALUE;
+  static readonly CMD_VIA_LIGHTING_GET_VALUE = CMD_VIA_LIGHTING_GET_VALUE;
+  static readonly CMD_VIA_LIGHTING_SAVE = CMD_VIA_LIGHTING_SAVE;
+  static readonly CMD_VIA_MACRO_GET_COUNT = CMD_VIA_MACRO_GET_COUNT;
+  static readonly CMD_VIA_MACRO_GET_BUFFER_SIZE = CMD_VIA_MACRO_GET_BUFFER_SIZE;
+  static readonly CMD_VIA_MACRO_GET_BUFFER = CMD_VIA_MACRO_GET_BUFFER;
+  static readonly CMD_VIA_MACRO_SET_BUFFER = CMD_VIA_MACRO_SET_BUFFER;
+  static readonly CMD_VIA_GET_LAYER_COUNT = CMD_VIA_GET_LAYER_COUNT;
+  static readonly CMD_VIA_KEYMAP_GET_BUFFER = CMD_VIA_KEYMAP_GET_BUFFER;
 
-  // Vial (VIALRGB) command constants
-  static readonly VIALRGB_GET_INFO = 0x40;
-  static readonly VIALRGB_GET_MODE = 0x41;
-  static readonly VIALRGB_GET_SUPPORTED = 0x42;
-  static readonly VIALRGB_SET_MODE = 0x41;
+  static readonly VIA_LAYOUT_OPTIONS = VIA_VALUE_LAYOUT_OPTIONS;
+  static readonly VIA_SWITCH_MATRIX_STATE = VIA_VALUE_SWITCH_MATRIX_STATE;
 
-  // ---- Viable-only command constants (kept for service-layer compile compatibility) ----
-  // These commands are NOT part of standard VIA/Vial. They are emitted by Viable
-  // firmware behind a 0xDD wrapper, which this Vial-only build does not support.
-  // Calling sendViable() at runtime will throw a clear error.
+  static readonly QMK_BACKLIGHT_BRIGHTNESS = QMK_BACKLIGHT_BRIGHTNESS;
+  static readonly QMK_BACKLIGHT_EFFECT = QMK_BACKLIGHT_EFFECT;
+  static readonly QMK_RGBLIGHT_BRIGHTNESS = QMK_RGBLIGHT_BRIGHTNESS;
+  static readonly QMK_RGBLIGHT_EFFECT = QMK_RGBLIGHT_EFFECT;
+  static readonly QMK_RGBLIGHT_EFFECT_SPEED = QMK_RGBLIGHT_EFFECT_SPEED;
+  static readonly QMK_RGBLIGHT_COLOR = QMK_RGBLIGHT_COLOR;
+
+  static readonly VIALRGB_GET_INFO = VIALRGB_GET_INFO;
+  static readonly VIALRGB_GET_MODE = VIALRGB_GET_MODE;
+  static readonly VIALRGB_GET_SUPPORTED = VIALRGB_GET_SUPPORTED;
+  static readonly VIALRGB_SET_MODE = VIALRGB_SET_MODE;
+
+  // Viable-only command IDs (kept as constants so service files compile;
+  // sendViable() will throw at runtime if actually invoked)
   static readonly CMD_VIABLE_GET_INFO = 0x00;
   static readonly CMD_VIABLE_TAP_DANCE_GET = 0x01;
   static readonly CMD_VIABLE_TAP_DANCE_SET = 0x02;
@@ -71,12 +120,11 @@ export class VialUSB {
   static readonly CMD_VIABLE_FRAGMENT_GET_SELECTIONS = 0x19;
   static readonly CMD_VIABLE_FRAGMENT_SET_SELECTIONS = 0x1a;
 
-  private device?: HIDDevice;
-  private queue: Promise<void> = Promise.resolve();
-  private listener: (data: ArrayBuffer, ev: HIDInputReportEvent) => void = () => {};
+  static readonly VIABLE_UNSUPPORTED_MSG =
+    "Viable-only command invoked on a Vial/VIA-only build. " +
+    "This keyboard does not expose the 0xDF Viable protocol.";
 
-  public onDisconnect?: () => void;
-
+  // ---- connection lifecycle ----
   private handleDisconnect = (event: HIDConnectionEvent) => {
     if (this.device && event.device === this.device) {
       console.log("Device disconnected:", event.device.productName);
@@ -88,11 +136,8 @@ export class VialUSB {
   async open(filters: HIDDeviceFilter[]): Promise<boolean> {
     const devices = await navigator.hid.requestDevice({ filters });
     if (devices.length !== 1) return false;
-
     this.device = devices[0];
-    if (!this.device.opened) {
-      await this.device.open();
-    }
+    if (!this.device.opened) await this.device.open();
     await this.initListener();
     navigator.hid.addEventListener("disconnect", this.handleDisconnect);
     console.log("USB device opened:", this.device.productName);
@@ -128,351 +173,239 @@ export class VialUSB {
     this.device.addEventListener("inputreport", handleEvent);
   }
 
-  // ---- raw message building ------------------------------------------------
-
+  // ---- message building ----
   /**
-   * Build a raw VIA message: [0xFE][cmd][args...], zero-padded to MSG_LEN.
+   * Build a 32-byte HID report for QMK-VIA / Vial.
+   *   report[0] = command ID
+   *   report[1..] = arguments
+   *   remainder  = zero (already zero from Uint8Array constructor)
    */
   private buildMessage(cmd: number, args: number[]): Uint8Array {
-    const message = new Uint8Array(MSG_LEN);
-    message[0] = VIA_PREFIX;
-    message[1] = cmd;
-    for (let i = 0; i < args.length && i < MSG_LEN - 2; i++) {
-      message[2 + i] = args[i];
+    const msg = new Uint8Array(MSG_LEN);
+    msg[0] = cmd;
+    for (let i = 0; i < args.length && i < MSG_LEN - 1; i++) {
+      msg[1 + i] = args[i];
     }
-    return message;
+    if (VialUSB.DEBUG) {
+      const hex = Array.from(msg.slice(0, 8))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(" ");
+      console.log(`[VIA] TX cmd=0x${cmd.toString(16)} : ${hex}`);
+    }
+    return msg;
   }
 
-  // ---- send / response parsing --------------------------------------------
-
-  // Overload signatures
-  async send(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index: number }): Promise<number | bigint>;
-  async send(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index?: undefined }): Promise<(number | bigint)[]>;
-  async send(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index: number }): Promise<number>;
-  async send(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index?: undefined }): Promise<Uint8Array>;
-  async send(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index: number }): Promise<number>;
-  async send(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index?: undefined }): Promise<Uint16Array>;
-  async send(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index: number }): Promise<number>;
-  async send(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index?: undefined }): Promise<Uint32Array>;
-  async send(cmd: number, args: number[], options?: USBSendOptions): Promise<Uint8Array>;
-
-  /**
-   * Send a VIA command and await the matching response.
-   * Response must start with [0xFE][cmd] (echoed command byte).
-   */
+  // ---- public send ----
   async send(
     cmd: number,
     args: number[],
     options: USBSendOptions = {}
-  ): Promise<Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[]> {
+  ): Promise<Uint8Array> {
     if (!this.device) throw new Error("USB device not connected");
 
     const message = this.buildMessage(cmd, args);
 
-    const operation = this.queue.then(async () => {
-      return new Promise<Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[]>((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          console.warn("USB Command Timed out waiting for valid response:", cmd);
-          reject(new Error("USB Command Timeout"));
-        }, 1000);
+    const operation = this.queue.then(
+      () =>
+        new Promise<Uint8Array>((resolve, reject) => {
+          const timeoutId = setTimeout(() => {
+            console.warn(
+              "USB Command Timed out waiting for valid response:",
+              cmd
+            );
+            reject(new Error("USB Command Timeout"));
+          }, 1000);
 
-        this.listener = (data: ArrayBuffer) => {
-          const u8 = new Uint8Array(data);
+          this.listener = (data: ArrayBuffer) => {
+            const u8 = new Uint8Array(data);
 
-          // Must be a VIA response and echo the command we sent.
-          if (u8[0] !== VIA_PREFIX) return;
-          if (u8[1] !== cmd) return;
+            // QMK-VIA echo rule: report[0] is the command ID echoed back.
+            if (u8[0] !== cmd) return;
 
-          if (options.validateInput) {
-            if (!options.validateInput(u8)) return;
-          }
+            if (options.validateInput) {
+              if (!options.validateInput(u8)) return;
+            }
 
-          clearTimeout(timeoutId);
-          try {
-            const result = this.parseResponse(data, options);
-            resolve(result);
-          } catch (e) {
-            reject(e);
-          }
-        };
+            if (VialUSB.DEBUG) {
+              const hex = Array.from(u8.slice(0, 8))
+                .map((b) => b.toString(16).padStart(2, "0"))
+                .join(" ");
+              console.log(`[VIA] RX cmd=0x${cmd.toString(16)} : ${hex}`);
+            }
 
-        this.device!.sendReport(0, message as BufferSource).catch(err => {
-          clearTimeout(timeoutId);
-          reject(err);
-        });
-      });
-    });
+            clearTimeout(timeoutId);
+            try {
+              const result = this.parseResponse(data, options);
+              resolve(result as Uint8Array);
+            } catch (e) {
+              reject(e);
+            }
+          };
+
+          this.device!.sendReport(0, message as BufferSource).catch((err: unknown) => {
+            clearTimeout(timeoutId);
+            reject(err);
+          });
+        })
+    );
 
     this.queue = operation.then(() => undefined).catch(() => undefined);
     return operation;
   }
 
-  // ---- sendViable (compile-compatible stub) ---------------------------------
-  // Viable-only commands (Tap Dance / Combo / Key Override / QMK Settings /
-  // Fragment / Alt-Repeat / Leader / One-Shot / Viable Definition / Save /
-  // Reset) are NOT part of standard VIA/Vial. This build is Vial-only, so we
-  // keep the API surface so existing services compile, but invoking it at
-  // runtime throws a clear, actionable error instead of silently misbehaving.
-
-  static get VIABLE_UNSUPPORTED_MSG(): string {
-    return (
-      "Viable-only command called on a Vial-only build. " +
-      "Tap Dance / Combo / Key Override / QMK Settings / Fragment / " +
-      "Alt-Repeat / Leader / One-Shot / Viable Definition / Save / Reset " +
-      "require Viable firmware and are not supported here."
+  /**
+   * sendViable: Viable-only commands (0xDF protocol) are NOT supported by
+   * standard QMK-VIA / Vial firmware. This stub exists so service files that
+   * reference usb.sendViable(...) continue to compile. At runtime it throws
+   * a clear error if a Viable-only feature is actually triggered.
+   */
+  async sendViable(
+    cmd: number,
+    args: number[],
+    _options: USBSendOptions = {}
+  ): Promise<never> {
+    console.warn(
+      `sendViable called (cmd=0x${cmd.toString(16)}, args=${JSON.stringify(args)})`
     );
-  }
-
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index: number }): Promise<number | bigint>;
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { unpack: string; index?: undefined }): Promise<(number | bigint)[]>;
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index: number }): Promise<number>;
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint8: true; index?: undefined }): Promise<Uint8Array>;
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index: number }): Promise<number>;
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint16: true; index?: undefined }): Promise<Uint16Array>;
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index: number }): Promise<number>;
-  async sendViable(cmd: number, args: number[], options: USBSendOptions & { uint32: true; index?: undefined }): Promise<Uint32Array>;
-  async sendViable(cmd: number, args: number[], options?: USBSendOptions): Promise<Uint8Array>;
-  async sendViable(cmd: number, args: number[], _options: USBSendOptions = {}): Promise<never> {
-    void cmd; void args;
     throw new Error(VialUSB.VIABLE_UNSUPPORTED_MSG);
   }
 
-  // ---- response parsing ----------------------------------------------------
-
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { unpack: string; index: number }): number | bigint;
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { unpack: string; index?: undefined }): (number | bigint)[];
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint8: true; index: number }): number;
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint8: true; index?: undefined }): Uint8Array;
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint16: true; index: number }): number;
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint16: true; index?: undefined }): Uint16Array;
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint32: true; index: number }): number;
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions & { uint32: true; index?: undefined }): Uint32Array;
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions): Uint8Array;
-
-  private parseResponse(data: ArrayBuffer, options: USBSendOptions): Uint8Array | Uint16Array | Uint32Array | number | bigint | (number | bigint)[] {
+  // ---- response parsing ----
+  private parseResponse(data: ArrayBuffer, options: USBSendOptions): Uint8Array {
     const skipBytes = options.skipBytes || 0;
-    const dv = new DataView(data);
     const u8 = new Uint8Array(data);
 
-    if (options.unpack) {
-      const offsetDv = skipBytes > 0 ? new DataView(data, skipBytes) : dv;
-      const unpacked = this.unpackData(offsetDv, options.unpack);
-      if (options.index !== undefined) {
-        return unpacked[options.index];
-      }
-      return unpacked;
-    }
-
     if (options.uint8) {
-      if (options.index !== undefined) {
-        return u8[skipBytes + options.index];
-      }
-      return skipBytes > 0 ? u8.slice(skipBytes) : u8;
+      const sliced = skipBytes > 0 ? u8.slice(skipBytes) : u8;
+      return sliced;
     }
 
-    if (options.uint16) {
-      const littleEndian = !options.bigendian;
-      if (options.index !== undefined) {
-        return dv.getUint16(skipBytes + options.index, littleEndian);
-      }
-      const numValues = Math.floor((data.byteLength - skipBytes) / 2);
-      const values: number[] = [];
-      for (let i = 0; i < numValues; i++) {
-        values.push(dv.getUint16(skipBytes + i * 2, littleEndian));
-      }
-      let u16Array = new Uint16Array(values);
-      if (options.slice !== undefined) {
-        u16Array = u16Array.slice(options.slice);
-      }
-      return u16Array;
-    }
-
-    if (options.uint32) {
-      const littleEndian = !options.bigendian;
-      if (options.index !== undefined) {
-        return dv.getUint32(skipBytes + options.index, littleEndian);
-      }
-      const numValues = Math.floor((data.byteLength - skipBytes) / 4);
-      const values: number[] = [];
-      for (let i = 0; i < numValues; i++) {
-        values.push(dv.getUint32(skipBytes + i * 4, littleEndian));
-      }
-      return new Uint32Array(values);
-    }
-
+    // default: return raw bytes after skipBytes
     return skipBytes > 0 ? u8.slice(skipBytes) : u8;
   }
 
-  private unpackData(dv: DataView, format: string): (number | bigint)[] {
-    const results: (number | bigint)[] = [];
-    let offset = 0;
-    let littleEndian = true;
-
-    if (format.includes("<")) littleEndian = true;
-    if (format.includes(">")) littleEndian = false;
-
-    const formatChars = format.replace(/[<>]/g, "");
-
-    for (const char of formatChars) {
-      switch (char) {
-        case "B":
-          results.push(dv.getUint8(offset));
-          offset += 1;
-          break;
-        case "H":
-          results.push(dv.getUint16(offset, littleEndian));
-          offset += 2;
-          break;
-        case "I":
-          results.push(dv.getUint32(offset, littleEndian));
-          offset += 4;
-          break;
-        case "Q":
-          results.push(dv.getBigUint64(offset, littleEndian));
-          offset += 8;
-          break;
-      }
-    }
-
-    return results;
-  }
-
-  // ---- buffered transfer helpers ------------------------------------------
-
-  /**
-   * Read `size` bytes from a VIA buffered-get command in 22-byte chunks.
-   * VIA payload per report = 32 - 2 (VIA header) = 30, but keymap/getkeycode
-   * uses a 2-byte offset header, so chunk payload is 22 bytes of useful data.
-   */
+  // ---- buffered transfer (VIA 22-byte chunks) ----
   async getViaBuffer(
     cmd: number,
     size: number,
-    options: USBSendOptions = {},
-    checkComplete?: (data: number[] | Uint8Array) => boolean
-  ): Promise<number[] | Uint8Array> {
-    const chunksize = 22;
-    const bytes = options.bytes || 1;
+    options: USBSendOptions = {}
+  ): Promise<Uint8Array> {
+    const chunksize = 22; // VIA payload per report
     const alldata: number[] = [];
     let offset = 0;
 
     while (offset < size) {
-      let sz = chunksize;
-      if (sz > size - offset) {
-        sz = size - offset;
-      }
-
-      // BE16(offset) = two bytes, big-endian offset, then size
-      const args = [((offset >> 8) & 0xff), (offset & 0xff), sz];
+      const sz = Math.min(chunksize, size - offset);
+      // VIA offset is big-endian 16-bit
+      const args = [
+        (offset >> 8) & 0xff,
+        offset & 0xff,
+        sz,
+      ];
       const data = (await this.send(cmd, args, options)) as unknown as Uint8Array;
-
-      if (sz < chunksize) {
-        const sliceSize = Math.floor(sz / bytes);
-        alldata.push(...Array.from(data).slice(0, sliceSize));
-      } else {
-        alldata.push(...Array.from(data));
-      }
-
-      if (checkComplete && checkComplete(alldata)) {
-        break;
-      }
-
-      offset += chunksize;
-    }
-
-    if (options.uint16) {
-      return alldata;
+      for (let i = 0; i < data.length; i++) alldata.push(data[i]);
+      offset += sz;
     }
 
     return new Uint8Array(alldata);
   }
 
-  async pushViaBuffer(cmd: number, size: number, data: ArrayBuffer): Promise<void> {
+  async pushViaBuffer(
+    cmd: number,
+    size: number,
+    data: ArrayBuffer
+  ): Promise<void> {
     const buffer = new Uint8Array(data);
+    const chunkSize = 22;
     let offset = 0;
     let chunkOffset = 0;
-    const chunkSize = 22;
 
     while (offset < size) {
       const chunk = new Uint8Array(chunkSize);
       for (let i = 0; i < chunk.length && offset < size; i++) {
         chunk[i] = buffer[offset++];
       }
-
-      await this.send(cmd, [chunkOffset & 0xff, (chunkOffset >> 8) & 0xff, ...chunk], {});
+      await this.send(cmd, [
+        chunkOffset & 0xff,
+        (chunkOffset >> 8) & 0xff,
+        ...Array.from(chunk),
+      ], {});
       chunkOffset += chunk.length;
     }
   }
 
-  // ---- VIA Custom Value Protocol (0x07/0x08/0x09) -------------------------
-  // Channels: 0 = keyboard-specific, 1 = QMK backlight, 2 = QMK rgblight
+  // ---- Viable definition (not supported in VIA-only build) ----
+  async getViableDefinition(): Promise<Uint8Array> {
+    throw new Error(VialUSB.VIABLE_UNSUPPORTED_MSG);
+  }
 
-  /**
-   * Get a custom value.
-   * Request: [0xFE][0x08][channel][value_id]
-   * Response: [0xFE][0x08][channel][value_id][data...]
-   */
-  async customValueGet(channel: number, valueId: number, size: number = 2): Promise<Uint8Array> {
-    const resp = await this.send(
-      VialUSB.CMD_VIA_LIGHTING_GET_VALUE,
+  // ---- custom value protocol (0x07 / 0x08 / 0x09) ----
+  async customValueGet(
+    channel: number,
+    valueId: number,
+    size: number = 2
+  ): Promise<Uint8Array> {
+    const resp = (await this.send(
+      CMD_VIA_LIGHTING_GET_VALUE,
       [channel, valueId],
       {
         uint8: true,
-        skipBytes: 3, // skip cmd_echo, channel, value_id
-        validateInput: (u: Uint8Array) =>
-          u[0] === VialUSB.CMD_VIA_LIGHTING_GET_VALUE &&
+        skipBytes: 3, // skip cmd_echo + channel + value_id
+        validateInput: (u) =>
+          u[0] === CMD_VIA_LIGHTING_GET_VALUE &&
           u[1] === channel &&
           u[2] === valueId,
       }
-    );
-    return (resp as unknown as Uint8Array).slice(0, size);
+    )) as unknown as Uint8Array;
+    return resp.slice(0, size);
   }
 
-  /**
-   * Set a custom value.
-   * Request: [0xFE][0x07][channel][value_id][data...]
-   */
-  async customValueSet(channel: number, valueId: number, data: number[]): Promise<void> {
-    console.log(`customValueSet: channel=${channel}, valueId=${valueId}, data=[${data.join(", ")}]`);
+  async customValueSet(
+    channel: number,
+    valueId: number,
+    data: number[]
+  ): Promise<void> {
+    console.log(
+      `customValueSet: channel=${channel}, valueId=${valueId}, data=[${data.join(", ")}]`
+    );
     await this.send(
-      VialUSB.CMD_VIA_LIGHTING_SET_VALUE,
+      CMD_VIA_LIGHTING_SET_VALUE,
       [channel, valueId, ...data],
       {}
     );
   }
 
-  /**
-   * Save custom values to EEPROM.
-   * Request: [0xFE][0x09][channel]
-   */
   async customValueSave(channel: number): Promise<void> {
-    await this.send(VialUSB.CMD_VIA_LIGHTING_SAVE, [channel], {});
+    await this.send(CMD_VIA_LIGHTING_SAVE, [channel], {});
   }
 
-  // ---- Layer Color convenience (channel 0, value_ids 32-47) ---------------
-  // Color format: 2 bytes [hue, sat] (0-255, QMK HSV)
-
-  static readonly LAYER_COLOR_VALUE_ID_BASE = 32;
-  static readonly LAYER_COLOR_CHANNEL = 0;
-
-  async getLayerColor(layer: number): Promise<{ hue: number; sat: number }> {
-    const valueId = VialUSB.LAYER_COLOR_VALUE_ID_BASE + layer;
-    const data = await this.customValueGet(VialUSB.LAYER_COLOR_CHANNEL, valueId, 2);
+  // ---- layer color helpers (channel 0, value_id 32..47) ----
+  async getLayerColor(
+    layer: number
+  ): Promise<{ hue: number; sat: number }> {
+    const valueId = LAYER_COLOR_VALUE_ID_BASE + layer;
+    const data = await this.customValueGet(LAYER_COLOR_CHANNEL, valueId, 2);
     return { hue: data[0], sat: data[1] };
   }
 
-  async setLayerColor(layer: number, hue: number, sat: number): Promise<void> {
-    const valueId = VialUSB.LAYER_COLOR_VALUE_ID_BASE + layer;
-    console.log(`setLayerColor: layer=${layer}, valueId=${valueId}, hue=${hue}, sat=${sat}`);
-    await this.customValueSet(VialUSB.LAYER_COLOR_CHANNEL, valueId, [hue, sat]);
-    await this.customValueSave(VialUSB.LAYER_COLOR_CHANNEL);
+  async setLayerColor(
+    layer: number,
+    hue: number,
+    sat: number
+  ): Promise<void> {
+    const valueId = LAYER_COLOR_VALUE_ID_BASE + layer;
+    console.log(
+      `setLayerColor: layer=${layer}, valueId=${valueId}, hue=${hue}, sat=${sat}`
+    );
+    await this.customValueSet(LAYER_COLOR_CHANNEL, valueId, [hue, sat]);
+    await this.customValueSave(LAYER_COLOR_CHANNEL);
   }
 
   async getAllLayerColors(): Promise<Array<{ hue: number; sat: number }>> {
     const colors: Array<{ hue: number; sat: number }> = [];
     for (let i = 0; i < 16; i++) {
       try {
-        const color = await this.getLayerColor(i);
-        colors.push(color);
+        colors.push(await this.getLayerColor(i));
       } catch {
         colors.push({ hue: 0, sat: 0 });
       }
@@ -481,8 +414,6 @@ export class VialUSB {
   }
 }
 
-// Export singleton instance (recommended: create a fresh instance per connection)
+// ---- exports ----
 export const usbInstance = new VialUSB();
-
-// Backward-compatibility alias for existing imports
 export { VialUSB as ViableUSB };
